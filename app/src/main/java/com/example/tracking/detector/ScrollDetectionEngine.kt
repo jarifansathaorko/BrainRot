@@ -44,6 +44,12 @@ class ScrollDetectionEngine(
         private const val INSTAGRAM_SWIPE_COOLDOWN_MS = 900L
         private const val INSTAGRAM_COMMENT_SHEET_SUPPRESSION_MS = 1200L
         private const val MAX_COMMENT_CONTAINER_ANCESTOR_DEPTH = 15
+        // YouTube Shorts: the full-screen player is a vertical RecyclerView whose view id is
+        // `reel_recycler`. One swipe emits a burst of scroll events while the pager moves and
+        // snaps; they are collapsed into one count. Applies to YouTube only.
+        private const val YOUTUBE_PACKAGE = "com.google.android.youtube"
+        private const val YOUTUBE_PAGER_ID_SUFFIX = "reel_recycler"
+        private const val YOUTUBE_SWIPE_BURST_GAP_MS = 250L
     }
 
     private val powerManager by lazy {
@@ -54,6 +60,7 @@ class ScrollDetectionEngine(
     private var lastEvalTimestamp: Long = 0L
     private var instagramCommentSheetOpenedAt: Long = 0L
     private var lastInstagramEventTimestamp: Long = 0L
+    private var lastYouTubePagerEventTimestamp: Long = 0L
 
     private var currentPackage: String? = null
     private var isCurrentlyWatchingReels: Boolean = false
@@ -302,6 +309,12 @@ class ScrollDetectionEngine(
     private fun handleScroll(packageName: String, appName: String, event: AccessibilityEvent) {
         val now = System.currentTimeMillis()
 
+        if (packageName == YOUTUBE_PACKAGE) {
+            if (handleYouTubeShortsPagerScroll(appName, event, now)) return
+            // Sibling scroll event emitted during the same Shorts swipe: never count it twice.
+            if (now - lastYouTubePagerEventTimestamp < YOUTUBE_SWIPE_BURST_GAP_MS) return
+        }
+
         // Reject comment-sheet events before debounce, context evaluation, or state
         // changes. The reel pager remains in the tree behind this sheet, so those
         // later checks alone cannot distinguish a comment RecyclerView from a reel.
@@ -367,6 +380,43 @@ class ScrollDetectionEngine(
 
         Log.d(TAG, "[SCROLL] Reel swipe counted for $appName ($packageName)")
         onScrollDetected(packageName, appName)
+    }
+
+    /**
+     * YouTube Shorts swipe detection. The event's own source identifies the Shorts pager
+     * (`reel_recycler`), so the decision no longer depends on a window-wide tree scan that can
+     * miss while the pager is mid-transition and clear the reel context. Events from one swipe
+     * arrive as a burst; only the first event of each burst is counted.
+     *
+     * @return true if the event came from the Shorts pager and was fully handled here
+     *         (counted or recognised as part of an already-counted swipe); false to let the
+     *         existing path decide.
+     */
+    private fun handleYouTubeShortsPagerScroll(appName: String, event: AccessibilityEvent, now: Long): Boolean {
+        val source = event.source ?: return false
+        val sourceId = try { source.viewIdResourceName?.lowercase() ?: "" } catch (_: Exception) { "" }
+        try { source.recycle() } catch (_: Exception) {}
+
+        if (!sourceId.endsWith(YOUTUBE_PAGER_ID_SUFFIX)) {
+            val dy = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) event.scrollDeltaY else Int.MIN_VALUE
+            Log.d(TAG, "[YT-SCROLL] not the Shorts pager: src=$sourceId class=${event.className} dy=$dy")
+            return false
+        }
+
+        val isNewSwipe = now - lastYouTubePagerEventTimestamp >= YOUTUBE_SWIPE_BURST_GAP_MS
+        lastYouTubePagerEventTimestamp = now
+        if (!isNewSwipe) return true
+
+        cachedIsReelContext = true
+        if (!isCurrentlyWatchingReels) {
+            isCurrentlyWatchingReels = true
+            onReelVisibilityChanged?.invoke(YOUTUBE_PACKAGE, appName, true)
+            Log.d(TAG, "[REEL] pkg=$YOUTUBE_PACKAGE  active=true  (via Shorts pager scroll)")
+        }
+        lastScrollTimestamp = now
+        Log.d(TAG, "[SCROLL] YouTube Shorts swipe counted")
+        onScrollDetected(YOUTUBE_PACKAGE, appName)
+        return true
     }
 
     /**
@@ -949,6 +999,8 @@ class ScrollDetectionEngine(
      */
     private fun isYouTubeShortsActive(root: AccessibilityNodeInfo, packageName: String): Boolean {
         if (hasVisibleViewId(root, "$packageName:id/reel_player_page_container")) return true
+        // Full-screen Shorts pager; absent from the home Shorts shelf, search and watch page.
+        if (hasVisibleViewId(root, "$packageName:id/reel_recycler")) return true
 
         try {
             val tabNodes = root.findAccessibilityNodeInfosByText("Shorts")
