@@ -174,7 +174,11 @@ class ScrollyAccessibilityService : AccessibilityService() {
     private fun incrementCount(pkg: String, appName: String) {
         val optimisticCount = ScrollyApp.instance.trackingRepository.todayTotalScrolls.value + 1
         mainHandler.post {
-            notchFloatingBarManager?.updateCount(optimisticCount, appName)
+            notchFloatingBarManager?.updateCount(
+                optimisticCount,
+                appName,
+                pulseInstagramIndicator = pkg == "com.instagram.android"
+            )
         }
         serviceScope.launch {
             try {

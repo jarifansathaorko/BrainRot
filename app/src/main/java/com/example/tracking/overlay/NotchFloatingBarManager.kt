@@ -88,6 +88,8 @@ class NotchFloatingBarManager(
 
     private var statsJob:  Job? = null
     private var configJob: Job? = null
+    private var statusDotFadeRunnable: Runnable? = null
+    private var isIncrementIndicatorActive = false
 
     init {
         // Observe live scroll count from repository
@@ -172,7 +174,12 @@ class NotchFloatingBarManager(
     /**
      * Updates the live scroll count instantly without morphing animations.
      */
-    fun updateCount(newCount: Int, appName: String = currentAppName, dailyGoal: Int = targetDailyGoal) {
+    fun updateCount(
+        newCount: Int,
+        appName: String = currentAppName,
+        dailyGoal: Int = targetDailyGoal,
+        pulseInstagramIndicator: Boolean = false
+    ) {
         currentScrollCount = newCount
         currentAppName     = appName
         targetDailyGoal    = dailyGoal
@@ -186,6 +193,7 @@ class NotchFloatingBarManager(
                 pillContainer?.alpha      = 1f
                 updateUI(newCount, appName, dailyGoal)
             }
+            if (pulseInstagramIndicator) pulseIncrementIndicator()
         }
 
         if (Looper.myLooper() == Looper.getMainLooper()) action.run() else mainHandler.post(action)
@@ -305,6 +313,9 @@ class NotchFloatingBarManager(
 
         val flags =
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE         or
+            // The bar is observational only. NOT_TOUCH_MODAL alone still consumes
+            // touches inside its bounds; NOT_TOUCHABLE passes every gesture through.
+            WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE         or
             WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL       or
             WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN      or
             WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS      or
@@ -527,6 +538,31 @@ class NotchFloatingBarManager(
 
     // ── UI updates ────────────────────────────────────────────────────────
 
+    /** One deterministic pulse per accepted Instagram Reel snap. */
+    private fun pulseIncrementIndicator() {
+        val dot = statusDot ?: return
+        statusDotFadeRunnable?.let(mainHandler::removeCallbacks)
+        dot.animate().cancel()
+        isIncrementIndicatorActive = true
+        (dot.background as? GradientDrawable)?.setColor(Color.parseColor("#FFD600"))
+        dot.visibility = View.VISIBLE
+        dot.alpha = 0f
+        dot.animate().alpha(1f).setDuration(100L).start()
+
+        statusDotFadeRunnable = Runnable {
+            dot.animate().cancel()
+            dot.animate()
+                .alpha(0f)
+                .setDuration(180L)
+                .withEndAction {
+                    dot.visibility = View.GONE
+                    dot.alpha = 1f
+                    isIncrementIndicatorActive = false
+                }
+                .start()
+        }.also { mainHandler.postDelayed(it, 600L) } // 100ms fade-in + 500ms hold
+    }
+
     private fun updateUI(count: Int, appName: String, dailyGoal: Int) {
         iconView?.text      = "🔥"
         countTextView?.text = count.toString()
@@ -539,7 +575,9 @@ class NotchFloatingBarManager(
             isNearLimit  -> Color.parseColor("#FFAB00") // Warning amber
             else         -> Color.parseColor("#4CAF50") // Safe green
         }
-        (statusDot?.background as? GradientDrawable)?.setColor(dotColor)
+        if (!isIncrementIndicatorActive) {
+            (statusDot?.background as? GradientDrawable)?.setColor(dotColor)
+        }
     }
 
     /**
