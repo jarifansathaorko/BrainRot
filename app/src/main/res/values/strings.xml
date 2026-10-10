@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Scrolly</string>
+    <string name="accessibility_service_label">Scrolly Scroll Tracker</string>
+    <string name="accessibility_service_description">Scrolly uses accessibility events to detect when you scroll through short-form video feeds (Reels, Shorts, Spotlight) in supported apps to help you monitor your digital wellbeing. Scrolly does NOT read private messages, passwords, or personal data.</string>
+</resources>

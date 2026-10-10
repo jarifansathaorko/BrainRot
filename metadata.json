@@ -1,0 +1,6 @@
+{
+  "name": "Scrolly",
+  "description": "See how much you scroll. Take back control with playful gamified tracking, brain mascot states, app breakdown, and friend battles.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

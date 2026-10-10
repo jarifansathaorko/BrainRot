@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Brain mascot body (Scrolly) centered within 66dp zone (21 to 87) -->
+    <!-- Brain left lobes -->
+    <path
+        android:fillColor="#FFAE53"
+        android:pathData="M38,40 C32,40 28,45 28,52 C28,58 31,63 35,66 C33,70 35,76 40,78 C45,80 50,78 53,75 C54,75 55,75 56,75 C59,78 64,80 69,78 C74,76 76,70 74,66 C78,63 81,58 81,52 C81,45 77,40 71,40 C69,35 64,32 58,33 C56,33 54,34 53,35 C52,34 50,33 48,33 C42,32 37,35 38,40 Z" />
+
+    <!-- Brain inner fold details -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#DD8526"
+        android:strokeWidth="2"
+        android:strokeLineCap="round"
+        android:pathData="M42,46 C40,49 41,54 44,56 M66,46 C68,49 67,54 64,56 M47,68 C50,65 52,65 54,65 C56,65 58,65 61,68" />
+
+    <!-- Big cute eye left -->
+    <path
+        android:fillColor="#1B140E"
+        android:pathData="M44,53 A 4.5 5.5 0 1 0 44,64 A 4.5 5.5 0 1 0 44,53 Z" />
+    <!-- Left eye shine -->
+    <path
+        android:fillColor="#FFF7ED"
+        android:pathData="M43,55 A 1.8 2 0 1 0 43,59 A 1.8 2 0 1 0 43,55 Z" />
+
+    <!-- Big cute eye right -->
+    <path
+        android:fillColor="#1B140E"
+        android:pathData="M64,53 A 4.5 5.5 0 1 0 64,64 A 4.5 5.5 0 1 0 64,53 Z" />
+    <!-- Right eye shine -->
+    <path
+        android:fillColor="#FFF7ED"
+        android:pathData="M63,55 A 1.8 2 0 1 0 63,59 A 1.8 2 0 1 0 63,55 Z" />
+
+    <!-- Cute smile -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#1B140E"
+        android:strokeWidth="2"
+        android:strokeLineCap="round"
+        android:pathData="M51,61 Q54,65 57,61" />
+
+    <!-- Rosy cheeks -->
+    <path
+        android:fillColor="#FF7A6A"
+        android:pathData="M37,59 A 2.5 1.8 0 1 0 37,62.6 A 2.5 1.8 0 1 0 37,59 Z" />
+    <path
+        android:fillColor="#FF7A6A"
+        android:pathData="M71,59 A 2.5 1.8 0 1 0 71,62.6 A 2.5 1.8 0 1 0 71,59 Z" />
+</vector>
