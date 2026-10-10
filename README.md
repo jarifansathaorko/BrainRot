@@ -56,7 +56,7 @@ Defined in `AppRecognitionEngine.SUPPORTED_APPS`:
 | Display name         | Package IDs                                                                 | Detection signal (summary)                                                   |
 |----------------------|-----------------------------------------------------------------------------|------------------------------------------------------------------------------|
 | Instagram Reels      | `com.instagram.android`, `com.instagram.lite`                               | `clips_viewer_view_pager` view ID, selected Reels tab, "Reels" header, swipe geometry |
-| YouTube Shorts       | `com.google.android.youtube`                                                | `reel_player_page_container` view ID, selected "Shorts" tab                  |
+| YouTube Shorts       | `com.google.android.youtube`                                                | Shorts pager/container view IDs (`reel_recycler`, `reel_player_page_container`, `reel_watch_fragment_root`, …), selected "Shorts" tab, full-screen pager geometry plus a full-screen video surface, sticky Shorts session (see [CP-21](#cp-21-youtube-shorts-session)–[CP-23](#cp-23-youtube-transient-tree-miss-retry)) |
 | TikTok               | `com.zhiliaoapp.musically`, `…musically.go`, `com.ss.android.ugc.trill`, `com.ss.android.ugc.aweme` | Treated as always-on vertical video; only excluded screens are ignored     |
 | Facebook Reels       | `com.facebook.katana`, `com.facebook.lite`                                  | Composer sticker/GIF text, selected Reels/Watch tab, "Reels" header, structural fallback |
 | Snapchat Spotlight   | `com.snapchat.android`                                                      | `spotlight_container` view ID (partial, see [limitations](#11-known-limitations)) |
@@ -105,8 +105,9 @@ app/src/main/java/com/example/
 ├── ScrollyApp.kt              Application: builds DB and repositories; anonymous Firebase sign-in
 ├── tracking/
 │   ├── accessibility/         ScrollyAccessibilityService, AccessibilityHelper (permission checks)
-│   ├── detector/              ScrollDetectionEngine, AppRecognitionEngine,
-│   │                          DisplayCutoutDetectionService, NotchDetectionHelper
+│   ├── detector/              ScrollDetectionEngine, YouTubeShortsRules (pure Shorts swipe rules),
+│   │                          AppRecognitionEngine, DisplayCutoutDetectionService,
+│   │                          NotchDetectionHelper
 │   └── overlay/               NotchFloatingBarManager (WindowManager pill),
 │                              DynamicIslandAnimationController
 ├── data/
@@ -198,7 +199,12 @@ flowchart TD
     P06 -- WINDOW_STATE --> W[Evaluate reel context for this screen]
     P06 -- VIEW_CLICKED --> C[CP-07 Classify tap]
     P06 -- CONTENT_CHANGED --> T[Throttled evaluation, 250 ms]
-    P06 -- VIEW_SCROLLED --> S{Instagram?}
+    P06 -- VIEW_SCROLLED --> YT{CP-06 YouTube package?}
+    YT -- yes --> Y1{CP-22 Shorts pager evidence and a completed swipe?}
+    Y1 -- count, session CP-21 refreshed --> K
+    Y1 -- duplicate, cooldown, horizontal, jitter, or panel scroll --> REJ
+    Y1 -- no Shorts evidence yet --> S
+    YT -- no --> S{Instagram?}
     S -- yes --> I1{CP-08 Comment sheet tapped in last 1.2 s?}
     I1 -- yes --> REJ([Reject])
     I1 -- no --> I2{CP-09 Source inside comment container?}
@@ -253,10 +259,11 @@ This section describes the exact path an event takes from the accessibility fram
 Each checkpoint lists where it lives, what it checks, what happens on pass or fail, and why it exists.
 
 #### CP-01: Event subscription and service configuration
-- **Where:** `res/xml/accessibility_service_config.xml`, `ScrollyAccessibilityService.onServiceConnected()`.
+- **Where:** `res/xml/accessibility_service_config.xml`, `ScrollyAccessibilityService.onServiceConnected()` → `applyServiceInfo()`.
 - **Checks:** the service subscribes to `TYPE_WINDOW_STATE_CHANGED`, `TYPE_WINDOW_CONTENT_CHANGED`, `TYPE_WINDOWS_CHANGED`, `TYPE_VIEW_SCROLLED`, and `TYPE_VIEW_CLICKED`. It uses `notificationTimeout = 100`, `FLAG_REPORT_VIEW_IDS`, `FLAG_RETRIEVE_INTERACTIVE_WINDOWS`, and `canRetrieveWindowContent = true`.
+- **How:** `applyServiceInfo()` reads the service's current `AccessibilityServiceInfo`, ORs the two flags into it, and writes it back, then logs whether `FLAG_REPORT_VIEW_IDS` actually stuck. Replacing the object instead would drop the XML defaults and is ignored on some OEM builds.
 - **Pass:** events are delivered to `onAccessibilityEvent`.
-- **Fail:** if the user has not enabled the service in Settings, nothing is counted. The Home screen shows this state.
+- **Fail:** if the user has not enabled the service in Settings, nothing is counted. The Home screen shows this state. If the view-id flag did not stick, `viewIdResourceName` is always null and YouTube Shorts counting falls back to session and geometry evidence (CP-21, CP-22).
 - **Why:** these are the only inputs the counter has. The service does not install touch listeners or intercept gestures.
 
 #### CP-02: Foreground tracking and non-social guard
@@ -289,9 +296,9 @@ Each checkpoint lists where it lives, what it checks, what happens on pass or fa
 #### CP-06: Event-type router
 - **Where:** `processAccessibilityEvent()`.
 - **Routes:**
-  - `TYPE_WINDOW_STATE_CHANGED` → `evaluateScreenContext(force = true)` and return. (The `force` flag is accepted but not used in the body.)
+  - `TYPE_WINDOW_STATE_CHANGED` → `evaluateScreenContext(force = true)` and return. `force` marks the event as a real screen change, which is the only situation where a negative tree scan may end a YouTube Shorts session ([CP-23](#cp-23-youtube-transient-tree-miss-retry)). For a YouTube window whose class name contains `shorts`, the session is opened straight away ([CP-21](#cp-21-youtube-shorts-session)).
   - `TYPE_VIEW_CLICKED` → `handleViewClicked()`. If the reel flag is on, also schedules a tree re-check.
-  - `TYPE_VIEW_SCROLLED` → `handleScroll()`. This is the only path that counts.
+  - `TYPE_VIEW_SCROLLED` → `handleScroll()`. This is the only path that counts. For `com.google.android.youtube` the event is first given to `handleYouTubeShortsScroll()` ([CP-22](#cp-22-youtube-shorts-swipe-rules)); if that path does not decide the event, the shared gates below still apply.
   - `TYPE_WINDOW_CONTENT_CHANGED` or `TYPE_WINDOWS_CHANGED` → if 250 ms or more have passed since the last evaluation, evaluate now. Otherwise schedule an evaluation 300 ms later. Each new schedule cancels the previous pending one.
   - Any other type → ignored.
 - **Why:** content changes can be very frequent. Throttling keeps the tree scans cheap.
@@ -351,6 +358,7 @@ Each checkpoint lists where it lives, what it checks, what happens on pass or fa
 - **Checks:** `now - lastScrollTimestamp >= 400 ms`.
 - **Fail:** drop silently.
 - **Why:** the same burst-suppression idea, with a shorter window for the other apps.
+- **Note:** YouTube normally never reaches this gate, because [CP-22](#cp-22-youtube-shorts-swipe-rules) decides its scroll events with a 250 ms burst gap and a 600 ms per-swipe cooldown. YouTube only falls through here when the Shorts path found no evidence at all.
 
 #### CP-14: Vertical-direction filter
 - **Where:** `isStrictlyVerticalScroll()`. Runs for all apps after their timing gates.
@@ -369,7 +377,7 @@ Each checkpoint lists where it lives, what it checks, what happens on pass or fa
 - **Checks** the event's text, content description, and class name for screens that are never reels. Keyword lists per app:
   - **Facebook:** "what's on your mind", "write a comment", "news feed", "marketplace", "groups", "friends, tab", "notifications", "menu"; classes `newsfeed`, `feedunit`, `storytray`, `marketplace`, `settingsactivity`.
   - **Instagram:** "your story", "add a comment", "direct messages", "search and explore", "comments", "reply"; classes `directinbox`, `directthread`, `feedfragment`, `profilefragment`, `editprofileactivity`, `comment`, `bottomsheet`.
-  - **YouTube:** "home" and "subscriptions" together (without "shorts"); classes `homefragment`, `browsefragment`, `settingsactivity`, `searchactivity`.
+  - **YouTube:** "home" and "subscriptions" together (without "shorts"); "add a comment" (watch page or the Shorts comment sheet); classes `homefragment`, `browsefragment`, `settingsactivity`, `searchactivity`. On the swipe path this ends the Shorts session outright; on the content-update path a match is ignored while a session is open, because YouTube repeats its bottom-tab labels there (see [CP-23](#cp-23-youtube-transient-tree-miss-retry)).
   - **TikTok:** classes `chatroom`, `imactivity`, `userprofile`, `profileactivity`; "edit profile", "direct messages".
   - **Spotify:** "your library", "playlists", "artists", "album"; classes `tracklist`, `playlistfragment`, `libraryfragment`.
 - **Pass:** continue.
@@ -377,20 +385,21 @@ Each checkpoint lists where it lives, what it checks, what happens on pass or fa
 - **Why:** a fast exit. If the user has left the viewer, the counter stops at once without needing a full tree scan.
 
 #### CP-16: Reel-context confirmation
-- **Where:** `handleScroll()` (`isReel` expression) and `checkNodeTreeStrictlyForReels()`.
+- **Where:** `handleScroll()` (`treeSaysReel` expression) and `checkNodeTreeStrictlyForReels()`.
 - **Rules:**
-  - **TikTok:** confirmed unless CP-15 rejected it. TikTok's feed is always vertical video, so no tree check runs.
+  - **TikTok:** confirmed (CP-15 already rejected the unambiguous non-reel screens above, so no second check and no tree scan are needed).
+  - **YouTube:** a swipe is counted only while a Shorts session is open ([CP-21](#cp-21-youtube-shorts-session)), which `confirmYouTubeShortsSession()` also mirrors in `cachedIsReelContext`. A swipe the Shorts rules left undecided (`NOT_SHORTS_PAGER` / `NEEDS_SHORTS_CONFIRMATION`) falls through to this checkpoint, and the reason is logged.
   - **All other apps:** confirmed if `cachedIsReelContext` is true, or if `isPositiveReelScreen()` returns true. The tree check only runs when the cached flag is false.
 - **Tree check** (`checkNodeTreeStrictlyForReels`): gets the focused application window's root node (falling back to the active root), dispatches by package, and recycles the root:
   - **Facebook Katana:** "What's on your mind?" visible → false. Composer sticker/GIF text visible → true. A breadth-first scan of up to 400 nodes checks selected tabs: Home or News Feed selected → false; Friends, Menu, or Notifications selected → false; a selected tab with Reels, Video, or Watch → true. A "Reels" header in the top 25% of the screen → true. Structural fallback: a scrollable RecyclerView at least 90% wide and 75% tall, containing a long-clickable Button of the same size, containing a SurfaceView of the same size → true.
   - **Facebook Lite:** `com.facebook.lite:id/video_view` visible.
   - **Instagram:** comment sheet open → false (fast negative). `clips_viewer_view_pager` visible → true. A breadth-first scan of up to 350 nodes: selected Home or Feed → false; selected Reels or Clips → true; "Reels" header in the top 25% → true.
-  - **YouTube:** `reel_player_page_container` visible → true; a selected node with text "Shorts" → true.
+  - **YouTube:** any Shorts pager/container view ID from `YouTubeShortsRules.SHORTS_CONTAINER_VIEW_IDS` present in the tree (visible, or with real bounds when Android flags it as not visible to the user) → true; a node whose view ID contains a Shorts marker (`reel_recycler`, `reel_watch_fragment_root`, `shorts_*`, `immersionless*`) → true; a selected or focused node labelled "Shorts" → true; structural fallback — a scrollable container at least 90% wide and 70% tall **and** a `SurfaceView`/`TextureView`/player view at least 75% of the screen height → true.
   - **Snapchat:** `com.snapchat.android:id/spotlight_container` visible → true. Reached only through the scheduled re-check path (see limitations).
   - **Spotify and anything else:** false.
 - **Pass:** continue to CP-17.
 - **Fail:** the swipe is not counted and the method returns. On this scroll path the reel flag is not changed.
-- **Evaluation paths** (window and content changes, scheduled re-checks) behave differently. A negative result there calls `retainInstagramReelContext()`, which keeps Instagram's flag on through a transient tree miss so the pill does not flicker. Other apps turn the flag off.
+- **Evaluation paths** (window and content changes, scheduled re-checks) behave differently. A negative result there calls `retainReelContextOnTransientMiss()`, which keeps Instagram's flag on through a transient tree miss so the pill does not flicker, and keeps YouTube's Shorts session on while [CP-23](#cp-23-youtube-transient-tree-miss-retry) re-checks. Other apps turn the flag off.
 - **Why:** this is the only place where the count is tied to what is actually on screen, not just to the gesture.
 
 #### CP-17: Count and overlay activation
@@ -426,6 +435,37 @@ Each checkpoint lists where it lives, what it checks, what happens on pass or fa
   - **Stats, Block, and Profile:** read Room flows directly, so they update when the database rows change.
 - **Startup:** on creation, `TrackingRepository` reads today's stored total and seeds the in-memory value, then follows the `daily_stats` flow upward only (it never lowers the value from a stored one).
 
+#### CP-21: YouTube Shorts session
+- **Where:** `ScrollDetectionEngine.confirmYouTubeShortsSession()` / `endReelSession()`, flag `youtubeShortsSessionActive`.
+- **Opens on any of:**
+  - a tap whose text, content description, or view ID mentions Shorts or Reels (CP-07);
+  - a `TYPE_WINDOW_STATE_CHANGED` from YouTube whose class name contains `shorts`;
+  - a positive YouTube tree check (CP-16) from the window path, the content path, or a scheduled re-check;
+  - a counted Shorts swipe (CP-22).
+- **Closes on:** a non-social app in the foreground (CP-02), screen off (CP-03), an exit tap (CP-07), a negative screen (CP-15), `resetState()`, or the retry budget of CP-23 running out.
+- **Effect:** while open, `cachedIsReelContext` stays true and the pill remains on screen, so every later vertical full-height swipe in YouTube counts even if YouTube reports no view IDs and the tree scan is empty. That stickiness is the point: the previous rule ("the source view ID must end with `reel_recycler`") silently produced zero counts on versions where that ID is renamed, absent, or momentarily not rendered.
+- **Why:** Shorts is the only supported app where a *session* is needed to tell a feed swipe from list scrolling, because YouTube's home feed, watch page, and search all use full-height scrollable lists too.
+
+#### CP-22: YouTube Shorts swipe rules
+- **Where:** `handleYouTubeShortsScroll()` → `YouTubeShortsRules.classify()` (a pure function over primitives, unit-tested in `YouTubeShortsRulesTest`).
+- **Inputs:** the scroll source's view ID, class name, `isScrollable`, and bounds as a fraction of the screen; `scrollDeltaX`/`scrollDeltaY` when the platform exposes them (Android 9+); whether a full-screen video surface exists inside the source subtree; the session flag from CP-21; and the time since the last counted swipe and the last pager event.
+- **Evidence, any one of which identifies the Shorts pager:**
+  1. the view ID contains a Shorts marker (`reel_recycler`, `reel_player_page_container`, `reel_watch_fragment_root`, `reel_watch_fragment`, `reel_player_container`, `reel_watch_recycler`, `shorts_recycler`, `shorts_recyclerview`, `shorts_viewer`, `shorts_player`, `shorts_watch_container`, `immersionless`) — decisive;
+  2. the source is scrollable and covers at least 90% of the screen width and 70% of its height, and its class is not a horizontal/carousel/text class;
+  3. no view ID at all, a pager-shaped class name (`RecyclerView`, `ViewPager`, `ScrollView`, `ListView`, `NestedScroll`), **and** either a confirmed session or a full-screen video surface.
+
+  A view ID belonging to a comment sheet, chip bar, toolbar, panel, or search screen vetoes the event, and those scrolls are swallowed so the generic path cannot re-count them through the pager that stays alive behind the sheet.
+- **Movement gates:** `HORIZONTAL` when the horizontal delta dominates (checked first, so a sideways carousel with a reel ID is still rejected). A marker hit counts on its own — some YouTube versions dispatch the event after the snap has settled and report `scrollDeltaY = 0` — while other sources need real movement: `MOVEMENT_TOO_SMALL` under 24 px of jitter. With a confirmed session, a move of at least `max(150 px, 25% of screen height)` counts in either direction (YouTube reports "next short" as a negative delta). Without a session, only a snap of at least 55% of the screen height **onto a full-screen video surface** may open one, which is what keeps the home feed and the watch page uncounted. When the platform provides no deltas, a marker hit or a confirmed session is enough.
+- **Burst control:** `DUPLICATE_BURST_EVENT` under 250 ms from the previous pager event, `COOLDOWN` under 600 ms from the last counted swipe. Both refresh the burst window, so a long settle cannot leak a second count.
+- **Outcome:** `COUNT` records one scroll (CP-17 to CP-20) and refreshes the session; `NOT_SHORTS_PAGER` and `NEEDS_SHORTS_CONFIRMATION` fall through to CP-15/CP-16 and schedule a tree re-check so the next swipe counts. Every decision is logged as `[YT-SCROLL]` or `[SCROLL]`.
+
+#### CP-23: YouTube transient tree-miss retry
+- **Where:** `recoverYouTubeTreeMiss()`, called from `retainReelContextOnTransientMiss()` on the evaluation and scheduled re-check paths.
+- **Checks:** whether the negative scan came from a **window change** (`force = true`) while a Shorts session is open.
+- **Content-update scans:** the session is kept and no retry is spent. YouTube fires content updates constantly while a short plays, and its pager is regularly absent from the tree mid-transition.
+- **Window-change scans:** up to `YOUTUBE_MAX_TREE_MISSES` (3) re-checks, `YOUTUBE_TREE_RETRY_DELAY_MS` (400 ms) apart. A positive re-check re-confirms the session and resets the budget; an exhausted budget ends the session and hides the pill.
+- **Why:** with no budget the counter would stay on screen after the user leaves Shorts; with an instant clear (the old behaviour) a single empty scan during a transition hid the pill and stopped counting for the rest of the session.
+
 ### 5.3 Reel-active state machine
 
 The "reel active" flag controls whether the pill is shown. It changes in these places:
@@ -434,17 +474,20 @@ The "reel active" flag controls whether the pill is shown. It changes in these p
 stateDiagram-v2
     [*] --> Inactive
     Inactive --> Active: Reels or Shorts tap (CP-07)
+    Inactive --> Active: Shorts window class (CP-21)
     Inactive --> Active: Tree check positive in a scheduled or throttled evaluation
-    Inactive --> Active: Counted swipe passes CP-16
+    Inactive --> Active: Counted swipe passes CP-16 or CP-22
     Active --> Inactive: Exit tap (CP-07)
     Active --> Inactive: Negative screen (CP-15)
     Active --> Inactive: Non-social app in foreground (CP-02)
     Active --> Inactive: Screen off (CP-03)
+    Active --> Inactive: YouTube tree miss budget exhausted (CP-23)
     Active --> Inactive: Service interrupt or destroy (resetState)
 ```
 
-- **Instagram exception:** `retainInstagramReelContext()` keeps the flag on through a tree miss while a reel context is already confirmed. Explicit exit taps and negative screens still turn it off.
-- **`resetState()`** also clears `cachedIsReelContext`, the timestamps, and any pending re-check.
+- **Instagram exception:** `retainReelContextOnTransientMiss()` keeps the flag on through a tree miss while a reel context is already confirmed. Explicit exit taps and negative screens still turn it off.
+- **YouTube exception:** the same call routes to `recoverYouTubeTreeMiss()` (CP-21 to CP-23), which holds the Shorts session open and re-checks instead of hiding the pill.
+- **`resetState()`** also clears `cachedIsReelContext`, the YouTube session and retry counters, the timestamps, and any pending re-check.
 
 ### 5.4 Worked examples
 
@@ -469,6 +512,16 @@ stateDiagram-v2
 **Example D: TikTok vertical swipe (counted).**
 - CP-03 to CP-05 pass. CP-13 debounce passes (≥ 400 ms since the last count). CP-14 accepts the vertical delta. CP-15 finds no negative keywords. CP-16 confirms TikTok without a tree scan. Counted.
 
+**Example E: one YouTube Shorts swipe when no view ID is available (counted).**
+1. The user tapped the Shorts tab earlier, so CP-07 opened a Shorts session and the pill is on screen (CP-21).
+2. A scroll event arrives with no usable view ID, class `androidx.viewpager2.widget.ViewPager2`, `scrollDeltaY = -1080` (the "next short" direction).
+3. CP-22: the ID list matches nothing, but the class is pager-shaped and a session is confirmed, so the source counts as the Shorts pager. No panel or sheet ID vetoes it. Movement 1080 px ≥ `max(150, 25% of 2400)` and the burst gap and cooldown have passed → `COUNT`.
+4. The session is refreshed, the count increments, and the next short is recorded. A trailing event 40 ms later with `scrollDeltaY = 90` becomes `DUPLICATE_BURST_EVENT`, so the swipe is not double counted.
+
+**Example F: long fling through the YouTube home feed (not counted).**
+1. No Shorts session is open. The event has class `androidx.recyclerview.widget.RecyclerView`, `scrollDeltaY = 3000`, and the source subtree has no full-screen video surface.
+2. CP-22: no marker, and the entry rule needs a near full-page snap **onto** a full-screen video surface, so the verdict is `NEEDS_SHORTS_CONFIRMATION`. The event falls through to CP-15 and CP-16, the tree check finds no Shorts container, and nothing is counted. A tree re-check is scheduled so that a real Shorts viewer is recognised on the next swipe.
+
 ### 5.5 Constants
 
 | Constant | Value | Used at |
@@ -481,6 +534,16 @@ stateDiagram-v2
 | `INSTAGRAM_SWIPE_COOLDOWN_MS` | 900 ms | CP-12 |
 | `INSTAGRAM_COMMENT_SHEET_SUPPRESSION_MS` | 1200 ms | CP-08 |
 | `MAX_COMMENT_CONTAINER_ANCESTOR_DEPTH` | 15 | CP-09 |
+| `YouTubeShortsRules.BURST_GAP_MS` | 250 ms | CP-22 |
+| `YouTubeShortsRules.SWIPE_COOLDOWN_MS` | 600 ms | CP-22 |
+| `YouTubeShortsRules.MIN_SWIPE_JITTER_PX` | 24 px | CP-22 |
+| `YouTubeShortsRules.IN_SESSION_MIN_SWIPE_PX` / `_FRACTION` | 150 px / 25% of screen height | CP-22 |
+| `YouTubeShortsRules.ENTRY_MIN_SWIPE_FRACTION` / `_PX` | 55% of screen height / 900 px | CP-22 |
+| `YouTubeShortsRules.MIN_PAGER_WIDTH_FRACTION` / `_HEIGHT_` | 90% / 70% | CP-22, CP-16 |
+| `YouTubeShortsRules.MIN_SURFACE_HEIGHT_FRACTION` | 75% of screen height | CP-22, CP-16 |
+| `YOUTUBE_MAX_TREE_MISSES` | 3 | CP-23 |
+| `YOUTUBE_TREE_RETRY_DELAY_MS` | 400 ms | CP-23 |
+| `MAX_YOUTUBE_SURFACE_SCAN_NODES` / `_TREE_SCAN_NODES` | 60 / 300 | CP-22, CP-16 |
 | Frame duration clamp | 1–250 ms (default 16 ms) | CP-11 |
 | Node scan limits | Instagram 350, Facebook 400, comment sheet 200 | CP-16 |
 | Horizontal tolerance | `\|dx\| > \|dy\|` and `\|dx\| > 2` | CP-14 |
@@ -629,6 +692,30 @@ Prebuilt APKs (`scrolly.apk` and `public/app-debug.apk`) are committed at the re
 4. To test without a social app, use **Simulate scroll** on Home. The pill should appear and the count should increase.
 5. Open Instagram Reels or YouTube Shorts and swipe. The pill appears when a reel viewer is confirmed.
 
+### Verifying YouTube Shorts on a device
+
+YouTube is the app whose signals change most often, so the detector logs every decision it makes. If Shorts still does not count, capture this and the `[YT-SCROLL]` lines say which rule needs extending:
+
+```bash
+adb logcat -c
+adb logcat -s ScrollDetectionEngine:V ScrollyAccessService:V
+# then: tap the Shorts tab and swipe a few times
+```
+
+| Log line | Meaning |
+|----------|---------|
+| `[SERVICE] config applied — viewIds=true` | `FLAG_REPORT_VIEW_IDS` is active, so id-based rules work |
+| `[SERVICE] FLAG_REPORT_VIEW_IDS did not stick` | IDs are unavailable; the session and geometry fallbacks are doing the work |
+| `[CLICK] Reel/Shorts tap detected in com.google.android.youtube` | Shorts tapped, session opened (CP-21) |
+| `[REEL] pkg=com.google.android.youtube active=true (via …)` | The pill was requested; the reason names the path that confirmed Shorts |
+| `[YT] Shorts confirmed by view id / pager marker / structurally` | Which evidence the tree check used (CP-16) |
+| `[SCROLL] YouTube Shorts swipe counted` and `[COUNT] +1 YouTube Shorts … → today=N` | One swipe accepted and stored |
+| `[YT-SCROLL] Inconclusive — …` | The swipe carried no Shorts evidence yet. The `src=`, `class=`, `height=`, `dy=` values in that line are what to report when a device does not count |
+| `[YT] Shorts session kept through a content-update tree miss` | YouTube's tree was empty mid-transition; counting was allowed to continue (CP-23) |
+| `[SESSION] Ending reel session … — negative screen` | A non-reel screen (search, settings, comment field, home tab) ended the session |
+
+If the log shows **no** `TYPE_VIEW_SCROLLED` events at all while swiping Shorts, the events are not being delivered: re-enable the service under Settings > Accessibility, keep Scrolly exempt from battery optimisation, and check that no OEM "battery saver" or "sleep standby" optimiser is freezing the service.
+
 ---
 
 ## 11. Known limitations
@@ -641,11 +728,12 @@ These were found by reading the code. They were not all reproduced on a device.
 4. **Battles, achievements, and profile stats are not driven by real data.** Battle scores are placeholders, achievement progress is never updated, `recordBattleResult()` is an empty stub, and the profile shows hard-coded totals.
 5. **Spotify Video never produces counts.** It is listed in `SUPPORTED_APPS`, but `checkNodeTreeStrictlyForReels()` has no Spotify branch.
 6. **Snapchat detection is partial.** The `spotlight_container` check is only reached through the scheduled re-check path. On the scroll path, Snapchat counts only after a Spotlight tap sets the cached context.
-7. **Exit keywords are substring matches.** Words such as `you`, `back`, and `home` can match unrelated labels and end a reel session early.
-8. **Instagram needs Android 9 or later.** Below API 28, the scroll deltas are unavailable, so Instagram is never counted.
+7. **Exit keywords are substring matches.** Words such as `you`, `back`, and `home` can match unrelated labels and end a reel session early. For YouTube that means an exit tap can close a Shorts session, and the next swipe has to re-confirm the viewer (it usually does, through the Shorts pager ID or the full-screen pager geometry).
+8. **Instagram needs Android 9 or later.** Below API 28, the scroll deltas are unavailable, so Instagram is never counted. YouTube and the other apps accept a missing delta when their other evidence is strong enough (CP-22).
 9. **Destructive migrations.** Any Room version bump without a migration deletes local data. `scroll_events` is never pruned.
-10. **No automated tests for the counter.** `ScrollDetectionEngine` has no unit tests. Tests cover `BrainMascotState` and screenshot rendering only.
-11. **Dormant code.** `CameraX`, `Accompanist permissions`, `DataStore`, and `Play Services Location` are declared as commented-out dependencies.
+10. **YouTube Shorts is heuristic by construction.** `com.google.android.youtube` ships views without IDs, renames them between versions, and renders the Shorts pager asynchronously, so counting combines several weak signals (CP-21 to CP-23). Consequences: a swipe inside the 600 ms cooldown is dropped, so very fast flicking can under-count; and a full-height list snap while a stale Shorts session is still open (for example a long fling on the watch page right after leaving Shorts) can over-count for a moment until the window-change scan or an exit tap ends the session.
+11. **Tests for the counter exist but no device harness.** `YouTubeShortsRulesTest` covers the swipe rules as pure Kotlin and `YouTubeShortsDetectionTest` covers the engine paths with an empty tree; the `ExampleRobolectricTest` cases cover Instagram, Facebook, and TikTok regressions. None of them replays a real YouTube view hierarchy, so new YouTube IDs and class names still have to be read off a device with the logcat recipe above.
+12. **Dormant code.** `CameraX`, `Accompanist permissions`, `DataStore`, and `Play Services Location` are declared as commented-out dependencies.
 
 ---
 
