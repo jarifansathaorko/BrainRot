@@ -35,6 +35,13 @@ class ScrollDetectionEngine(
         private const val TAG = "ScrollDetectionEngine"
         private const val MIN_SCROLL_INTERVAL_MS = 400L
         private const val THROTTLE_EVAL_MS = 250L
+        private const val INSTAGRAM_PACKAGE = "com.instagram.android"
+        // Instagram emits several accessibility scroll events for one Reel snap. These
+        // values deliberately apply only to Instagram; the existing detectors for the
+        // other supported apps retain their current behaviour.
+        private const val INSTAGRAM_MIN_VERTICAL_DISTANCE_PX = 240
+        private const val INSTAGRAM_MIN_VELOCITY_PX_PER_MS = 0.35f
+        private const val INSTAGRAM_SWIPE_COOLDOWN_MS = 900L
         private const val INSTAGRAM_COMMENT_SHEET_SUPPRESSION_MS = 1200L
         private const val MAX_COMMENT_CONTAINER_ANCESTOR_DEPTH = 15
     }
@@ -46,6 +53,7 @@ class ScrollDetectionEngine(
     private var lastScrollTimestamp: Long = 0L
     private var lastEvalTimestamp: Long = 0L
     private var instagramCommentSheetOpenedAt: Long = 0L
+    private var lastInstagramEventTimestamp: Long = 0L
 
     private var currentPackage: String? = null
     private var isCurrentlyWatchingReels: Boolean = false
@@ -179,6 +187,7 @@ class ScrollDetectionEngine(
         lastScrollTimestamp = 0L
         lastEvalTimestamp = 0L
         instagramCommentSheetOpenedAt = 0L
+        lastInstagramEventTimestamp = 0L
     }
 
     // ── Private helpers ───────────────────────────────────────────────────
@@ -296,7 +305,7 @@ class ScrollDetectionEngine(
         // Reject comment-sheet events before debounce, context evaluation, or state
         // changes. The reel pager remains in the tree behind this sheet, so those
         // later checks alone cannot distinguish a comment RecyclerView from a reel.
-        if (packageName.contains("instagram")) {
+        if (packageName == INSTAGRAM_PACKAGE) {
             if (now - instagramCommentSheetOpenedAt < INSTAGRAM_COMMENT_SHEET_SUPPRESSION_MS) {
                 Log.d(TAG, "[SCROLL] Rejected — Instagram comment sheet is animating")
                 return
@@ -306,9 +315,22 @@ class ScrollDetectionEngine(
                 Log.d(TAG, "[SCROLL] Rejected — inside Instagram comment sheet")
                 return
             }
-        }
 
-        if (now - lastScrollTimestamp < MIN_SCROLL_INTERVAL_MS) return
+            // Never infer Reels merely from a generic Instagram scroll. The user must
+            // already have entered the Reels viewer via its tab/node context.
+            if (!isCurrentlyWatchingReels || !cachedIsReelContext) {
+                Log.d(TAG, "[SCROLL] Rejected — Instagram is not in confirmed Reels view")
+                return
+            }
+
+            if (!isCompletedInstagramForwardSwipe(event, now)) return
+            if (now - lastScrollTimestamp < INSTAGRAM_SWIPE_COOLDOWN_MS) {
+                Log.d(TAG, "[SCROLL] Rejected — Instagram Reel snap is in cooldown")
+                return
+            }
+        } else if (now - lastScrollTimestamp < MIN_SCROLL_INTERVAL_MS) {
+            return
+        }
 
         // Reject horizontal swiping. YouTube Shorts can report the upward swipe to the next
         // short as a negative scroll delta, which the per-app check below accepts.
@@ -395,6 +417,43 @@ class ScrollDetectionEngine(
             } catch (_: Exception) {
             }
         }
+    }
+
+    /**
+     * Instagram-only completed-snap filter. A positive delta is the pager direction used
+     * by Instagram when advancing to the next Reel. Negative deltas (previous Reel), tiny
+     * content shifts/taps, and slow sheet movement are ignored.
+     *
+     * Accessibility events do not expose MotionEvent velocity. The velocity below is the
+     * passive equivalent: pager distance divided by time since the previous emitted scroll
+     * frame. No touch listener is installed and no gesture is intercepted.
+     */
+    private fun isCompletedInstagramForwardSwipe(event: AccessibilityEvent, now: Long): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+            Log.d(TAG, "[SCROLL] Rejected — Instagram event has no directional scroll delta")
+            return false
+        }
+
+        val deltaX = event.scrollDeltaX
+        val deltaY = event.scrollDeltaY
+        val eventTimestamp = event.eventTime.takeIf { it > 0L } ?: now
+        val frameDuration = if (lastInstagramEventTimestamp > 0L) {
+            (eventTimestamp - lastInstagramEventTimestamp).coerceIn(1L, 250L)
+        } else {
+            // The first accessibility frame is already a delta, so use one display frame.
+            16L
+        }
+        lastInstagramEventTimestamp = eventTimestamp
+
+        val velocity = deltaY.toFloat() / frameDuration.toFloat()
+        val accepted = deltaY >= INSTAGRAM_MIN_VERTICAL_DISTANCE_PX &&
+                abs(deltaX) < deltaY &&
+                velocity >= INSTAGRAM_MIN_VELOCITY_PX_PER_MS
+
+        if (!accepted) {
+            Log.d(TAG, "[SCROLL] Rejected Instagram motion — dx=$deltaX dy=$deltaY velocity=$velocity")
+        }
+        return accepted
     }
 
     private fun isStrictlyVerticalScroll(event: AccessibilityEvent, packageName: String): Boolean {
