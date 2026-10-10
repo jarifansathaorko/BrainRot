@@ -1,15 +1,20 @@
 package com.example
 
 import android.content.Context
+import android.os.Looper
+import android.view.accessibility.AccessibilityEvent
 import androidx.test.core.app.ApplicationProvider
 import com.example.data.repository.NotchSettingsRepository
 import com.example.data.repository.NotchType
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
+import java.util.concurrent.TimeUnit
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [36])
@@ -133,5 +138,123 @@ class ExampleRobolectricTest {
     }
     engine.processAccessibilityEvent(launcherEvent)
     org.junit.Assert.assertFalse("Notch must hide when leaving to launcher", isReelVisible)
+  }
+
+  @Test
+  fun `YouTube Shorts counts upward swipes reported with negative vertical deltas`() {
+    var detectedScrolls = 0
+    var isReelVisible = false
+    val engine = com.example.tracking.detector.ScrollDetectionEngine(
+      service = null,
+      onScrollDetected = { _, _ -> detectedScrolls++ },
+      onReelVisibilityChanged = { _, _, visible -> isReelVisible = visible }
+    )
+
+    val shortsClick = AccessibilityEvent.obtain(AccessibilityEvent.TYPE_VIEW_CLICKED).apply {
+      packageName = "com.google.android.youtube"
+      contentDescription = "Shorts"
+    }
+    engine.processAccessibilityEvent(shortsClick)
+    assertTrue("Opening Shorts should show the counter", isReelVisible)
+
+    val upwardSwipe = AccessibilityEvent.obtain(AccessibilityEvent.TYPE_VIEW_SCROLLED).apply {
+      packageName = "com.google.android.youtube"
+      className = "androidx.viewpager2.widget.ViewPager2"
+      scrollDeltaX = 0
+      scrollDeltaY = -1080
+    }
+    engine.processAccessibilityEvent(upwardSwipe)
+
+    assertEquals("An upward Shorts swipe should increment the counter", 1, detectedScrolls)
+    assertTrue("The counter should remain visible while scrolling Shorts", isReelVisible)
+  }
+
+  @Test
+  fun `Instagram Reels remains active through transient tree misses and counts scrolls`() {
+    var detectedScrolls = 0
+    var isReelVisible = false
+    val visibilityChanges = mutableListOf<Boolean>()
+    val engine = com.example.tracking.detector.ScrollDetectionEngine(
+      service = null,
+      onScrollDetected = { _, _ -> detectedScrolls++ },
+      onReelVisibilityChanged = { _, _, visible ->
+        isReelVisible = visible
+        visibilityChanges += visible
+      }
+    )
+
+    val reelsClick = AccessibilityEvent.obtain(AccessibilityEvent.TYPE_VIEW_CLICKED).apply {
+      packageName = "com.instagram.android"
+      contentDescription = "Reels"
+    }
+    engine.processAccessibilityEvent(reelsClick)
+    assertTrue("Opening Reels should show the counter", isReelVisible)
+
+    // The delayed strict tree check has no service/node tree in this test and therefore
+    // reproduces Instagram's transient false-negative during a UI transition.
+    shadowOf(Looper.getMainLooper()).idleFor(1300, TimeUnit.MILLISECONDS)
+    assertTrue("A transient tree miss must not hide the Instagram counter", isReelVisible)
+
+    val contentChanged = AccessibilityEvent.obtain(AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED).apply {
+      packageName = "com.instagram.android"
+      className = "android.widget.FrameLayout"
+    }
+    engine.processAccessibilityEvent(contentChanged)
+    assertTrue("An inconclusive content update must not hide the counter", isReelVisible)
+
+    val reelSwipe = AccessibilityEvent.obtain(AccessibilityEvent.TYPE_VIEW_SCROLLED).apply {
+      packageName = "com.instagram.android"
+      className = "androidx.viewpager2.widget.ViewPager2"
+      scrollDeltaX = 0
+      scrollDeltaY = 900
+    }
+    engine.processAccessibilityEvent(reelSwipe)
+    assertEquals("A Reel swipe should increment the counter", 1, detectedScrolls)
+    assertTrue("The counter should remain visible while scrolling Reels", isReelVisible)
+
+    val homeClick = AccessibilityEvent.obtain(AccessibilityEvent.TYPE_VIEW_CLICKED).apply {
+      packageName = "com.instagram.android"
+      contentDescription = "Home"
+    }
+    engine.processAccessibilityEvent(homeClick)
+    assertFalse("An explicit exit from Reels should still hide the counter", isReelVisible)
+    assertEquals(listOf(true, false), visibilityChanges)
+  }
+
+  @Test
+  fun `Facebook Reels keeps its existing vertical delta behavior`() {
+    var detectedScrolls = 0
+    var isReelVisible = false
+    val engine = com.example.tracking.detector.ScrollDetectionEngine(
+      service = null,
+      onScrollDetected = { _, _ -> detectedScrolls++ },
+      onReelVisibilityChanged = { _, _, visible -> isReelVisible = visible }
+    )
+
+    val reelsClick = AccessibilityEvent.obtain(AccessibilityEvent.TYPE_VIEW_CLICKED).apply {
+      packageName = "com.facebook.katana"
+      contentDescription = "Reels"
+    }
+    engine.processAccessibilityEvent(reelsClick)
+
+    val upwardSwipe = AccessibilityEvent.obtain(AccessibilityEvent.TYPE_VIEW_SCROLLED).apply {
+      packageName = "com.facebook.katana"
+      className = "androidx.viewpager2.widget.ViewPager2"
+      scrollDeltaX = 0
+      scrollDeltaY = -900
+    }
+    engine.processAccessibilityEvent(upwardSwipe)
+    assertEquals("Facebook's existing negative-delta rejection must not change", 0, detectedScrolls)
+
+    val verticalSwipe = AccessibilityEvent.obtain(AccessibilityEvent.TYPE_VIEW_SCROLLED).apply {
+      packageName = "com.facebook.katana"
+      className = "androidx.viewpager2.widget.ViewPager2"
+      scrollDeltaX = 0
+      scrollDeltaY = 900
+    }
+    engine.processAccessibilityEvent(verticalSwipe)
+
+    assertEquals("Facebook's existing positive vertical scroll should still count", 1, detectedScrolls)
+    assertTrue("Facebook Reels should remain visible", isReelVisible)
   }
 }

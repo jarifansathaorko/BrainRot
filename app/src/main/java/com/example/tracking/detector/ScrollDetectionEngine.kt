@@ -190,6 +190,19 @@ class ScrollDetectionEngine(
         Log.d(TAG, "[REEL] pkg=$pkg  active=false")
     }
 
+    /**
+     * Instagram can temporarily omit its Reels viewer nodes during UI updates. Once a
+     * Reels tab/click has confirmed the context, an inconclusive tree check must not
+     * dismiss the counter; explicit exit clicks and negative-screen checks still do.
+     */
+    private fun retainInstagramReelContext(packageName: String): Boolean {
+        if (!packageName.contains("instagram") || !isCurrentlyWatchingReels) return false
+
+        cachedIsReelContext = true
+        Log.d(TAG, "[REEL] pkg=$packageName  retaining active state during transient tree miss")
+        return true
+    }
+
     private fun scheduleEvaluation(activePkg: String, appName: String) {
         pendingEvalRunnable?.let { handler.removeCallbacks(it) }
         pendingEvalRunnable = Runnable {
@@ -201,7 +214,7 @@ class ScrollDetectionEngine(
                     cachedIsReelContext = true
                     onReelVisibilityChanged?.invoke(activePkg, appName, true)
                     Log.d(TAG, "[REEL] pkg=$activePkg  active=true  (via scheduled eval)")
-                } else {
+                } else if (!retainInstagramReelContext(activePkg)) {
                     setReelInactive(activePkg, appName)
                 }
             }
@@ -297,8 +310,9 @@ class ScrollDetectionEngine(
 
         if (now - lastScrollTimestamp < MIN_SCROLL_INTERVAL_MS) return
 
-        // Reject horizontal swiping
-        if (!isStrictlyVerticalScroll(event)) {
+        // Reject horizontal swiping. YouTube Shorts can report the upward swipe to the next
+        // short as a negative scroll delta, which the per-app check below accepts.
+        if (!isStrictlyVerticalScroll(event, packageName)) {
             Log.d(TAG, "[SCROLL] Rejected horizontal scroll in $packageName")
             return
         }
@@ -383,7 +397,7 @@ class ScrollDetectionEngine(
         }
     }
 
-    private fun isStrictlyVerticalScroll(event: AccessibilityEvent): Boolean {
+    private fun isStrictlyVerticalScroll(event: AccessibilityEvent, packageName: String): Boolean {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             val deltaX = event.scrollDeltaX
             val deltaY = event.scrollDeltaY
@@ -392,7 +406,9 @@ class ScrollDetectionEngine(
                 if (deltaX != 0 && deltaY == 0) return false
                 if (abs(deltaX) > abs(deltaY) && abs(deltaX) > 2) return false
                 if (deltaY > 0) return true
-                if (deltaY < 0) return false
+                // YouTube Shorts advances to the next short with an upward swipe, which
+                // its view pager reports as a negative delta. Keep all other apps' rule.
+                if (deltaY < 0) return packageName == "com.google.android.youtube"
             }
         }
 
@@ -431,15 +447,16 @@ class ScrollDetectionEngine(
 
         // 2. Strict Positive Check
         val isReel = isPositiveReelScreen(packageName, className, event)
-        cachedIsReelContext = isReel
 
         if (isReel) {
+            cachedIsReelContext = true
             if (!isCurrentlyWatchingReels) {
                 isCurrentlyWatchingReels = true
                 onReelVisibilityChanged?.invoke(packageName, appName, true)
                 Log.d(TAG, "[REEL] pkg=$packageName  active=true  (via evaluation)")
             }
-        } else {
+        } else if (!retainInstagramReelContext(packageName)) {
+            cachedIsReelContext = false
             if (isCurrentlyWatchingReels) {
                 setReelInactive(packageName, appName)
             }
