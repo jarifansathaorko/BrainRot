@@ -45,11 +45,18 @@ class ScrollDetectionEngine(
         private const val INSTAGRAM_COMMENT_SHEET_SUPPRESSION_MS = 1200L
         private const val MAX_COMMENT_CONTAINER_ANCESTOR_DEPTH = 15
         // YouTube Shorts: the full-screen player is a vertical RecyclerView whose view id is
-        // `reel_recycler`. One swipe emits a burst of scroll events while the pager moves and
-        // snaps; they are collapsed into one count. Applies to YouTube only.
+        // `reel_recycler` in some versions and something else (or nothing) in others. One swipe
+        // emits a burst of scroll events while the pager moves and snaps; they are collapsed into
+        // one count. All thresholds live in `YouTubeShortsRules`; see that file for the reasoning.
         private const val YOUTUBE_PACKAGE = "com.google.android.youtube"
-        private const val YOUTUBE_PAGER_ID_SUFFIX = "reel_recycler"
-        private const val YOUTUBE_SWIPE_BURST_GAP_MS = 250L
+        private const val YOUTUBE_SWIPE_BURST_GAP_MS = YouTubeShortsRules.BURST_GAP_MS
+        // YouTube renders the Shorts pager asynchronously, so a window scan can come back empty
+        // right after a transition (documented upstream as "works, then stops working until the
+        // app is reopened"). Retry a few times before the pill is dismissed.
+        private const val YOUTUBE_MAX_TREE_MISSES = 3
+        private const val YOUTUBE_TREE_RETRY_DELAY_MS = 400L
+        private const val MAX_YOUTUBE_SURFACE_SCAN_NODES = 60
+        private const val MAX_YOUTUBE_TREE_SCAN_NODES = 300
     }
 
     private val powerManager by lazy {
@@ -61,6 +68,9 @@ class ScrollDetectionEngine(
     private var instagramCommentSheetOpenedAt: Long = 0L
     private var lastInstagramEventTimestamp: Long = 0L
     private var lastYouTubePagerEventTimestamp: Long = 0L
+    private var youtubeShortsSessionActive: Boolean = false
+    private var youtubeTreeMissRetries: Int = 0
+    private var pendingYouTubeRecoveryRunnable: Runnable? = null
 
     private var currentPackage: String? = null
     private var isCurrentlyWatchingReels: Boolean = false
@@ -97,9 +107,9 @@ class ScrollDetectionEngine(
         // Screen off: immediately stop reel tracking
         powerManager?.let { pm ->
             if (!pm.isInteractive) {
-                if (isCurrentlyWatchingReels) {
+                if (isCurrentlyWatchingReels || youtubeShortsSessionActive) {
                     Log.d(TAG, "[SCREEN_OFF] Hiding overlay — screen is off")
-                    setReelInactive(currentPackage ?: "", "")
+                    endReelSession(currentPackage ?: "", "", "screen off")
                 }
                 return
             }
@@ -125,10 +135,10 @@ class ScrollDetectionEngine(
 
             if (!isEventPkgSupported) {
                 // Foreground changed to a non-social app — immediately hide overlay
-                if (isCurrentlyWatchingReels || currentPackage != eventPkg) {
+                if (isCurrentlyWatchingReels || youtubeShortsSessionActive || currentPackage != eventPkg) {
                     Log.d(TAG, "[WINDOW] Non-social foreground → force hide overlay")
                     currentPackage = eventPkg
-                    setReelInactive(eventPkg, "")
+                    endReelSession(eventPkg, "", "non-social foreground")
                 } else {
                     currentPackage = eventPkg
                 }
@@ -137,6 +147,13 @@ class ScrollDetectionEngine(
 
             val appName = AppRecognitionEngine.getAppName(eventPkg)
             currentPackage = eventPkg
+            // A Shorts-shaped window class is enough to re-open a session that YouTube's
+            // asynchronous rendering made the tree scan miss.
+            if (eventPkg == YOUTUBE_PACKAGE &&
+                className.lowercase().contains("shorts")
+            ) {
+                confirmYouTubeShortsSession("window class $className")
+            }
             evaluateScreenContext(eventPkg, appName, event, force = true)
             return
         }
@@ -181,6 +198,7 @@ class ScrollDetectionEngine(
     fun resetState() {
         pendingEvalRunnable?.let { handler.removeCallbacks(it) }
         pendingEvalRunnable = null
+        cancelYouTubeTreeRecovery()
         if (isCurrentlyWatchingReels) {
             val pkg = currentPackage ?: ""
             Log.d(TAG, "[RESET] Forcing reel-inactive due to resetState() for pkg=$pkg")
@@ -195,6 +213,9 @@ class ScrollDetectionEngine(
         lastEvalTimestamp = 0L
         instagramCommentSheetOpenedAt = 0L
         lastInstagramEventTimestamp = 0L
+        lastYouTubePagerEventTimestamp = 0L
+        youtubeShortsSessionActive = false
+        youtubeTreeMissRetries = 0
     }
 
     // ── Private helpers ───────────────────────────────────────────────────
@@ -207,16 +228,114 @@ class ScrollDetectionEngine(
     }
 
     /**
+     * Ends the reel session for [pkg]: hides the pill and clears every per-app sticky state, so
+     * the next swipe has to re-confirm the viewer. Used by all explicit exits (leaving the app,
+     * screen off, exit tap, a confirmed non-reel screen).
+     */
+    private fun endReelSession(pkg: String, appName: String, reason: String) {
+        val wasActive = isCurrentlyWatchingReels || youtubeShortsSessionActive
+        cancelYouTubeTreeRecovery()
+        youtubeShortsSessionActive = false
+        youtubeTreeMissRetries = 0
+        cachedIsReelContext = false
+        if (wasActive) {
+            Log.d(TAG, "[SESSION] Ending reel session for $pkg — $reason")
+            setReelInactive(pkg, appName)
+        }
+    }
+
+    /**
+     * Opens (or refreshes) the YouTube Shorts session and makes sure the pill is on screen.
+     * Every counting path funnels through here, which is what keeps counting alive while YouTube
+     * is mid-transition and its view tree is temporarily empty.
+     */
+    private fun confirmYouTubeShortsSession(reason: String) {
+        if (!youtubeShortsSessionActive) {
+            Log.d(TAG, "[YT] Shorts session opened — $reason")
+        }
+        youtubeShortsSessionActive = true
+        youtubeTreeMissRetries = 0
+        cachedIsReelContext = true
+        if (!isCurrentlyWatchingReels) {
+            isCurrentlyWatchingReels = true
+            val appName = AppRecognitionEngine.getAppName(YOUTUBE_PACKAGE)
+            onReelVisibilityChanged?.invoke(YOUTUBE_PACKAGE, appName, true)
+            Log.d(TAG, "[REEL] pkg=$YOUTUBE_PACKAGE  active=true  (via $reason)")
+        }
+    }
+
+    private fun cancelYouTubeTreeRecovery() {
+        pendingYouTubeRecoveryRunnable?.let { handler.removeCallbacks(it) }
+        pendingYouTubeRecoveryRunnable = null
+    }
+
+    /**
+     * YouTube renders the Shorts pager asynchronously. A negative tree scan while a session is
+     * open is therefore usually a transient miss, not an exit. It is only treated as an exit on
+     * a window change (a real navigation inside the app), where it gets a small retry budget
+     * first. Content-update scans never end the session.
+     *
+     * Returns true when the counter must stay on screen.
+     */
+    private fun recoverYouTubeTreeMiss(packageName: String, appName: String, fromWindowChange: Boolean): Boolean {
+        if (packageName != YOUTUBE_PACKAGE || !youtubeShortsSessionActive) return false
+
+        if (!fromWindowChange) {
+            cachedIsReelContext = true
+            Log.d(TAG, "[YT] Shorts session kept through a content-update tree miss")
+            return true
+        }
+
+        if (youtubeTreeMissRetries >= YOUTUBE_MAX_TREE_MISSES) {
+            Log.d(TAG, "[YT] Tree scan negative $youtubeTreeMissRetries times — Shorts really exited")
+            endReelSession(packageName, appName, "tree negative $YOUTUBE_MAX_TREE_MISSES times in a row")
+            return false
+        }
+
+        youtubeTreeMissRetries++
+        Log.d(TAG, "[YT] Shorts tree miss after a window change — re-check " +
+                "$youtubeTreeMissRetries/$YOUTUBE_MAX_TREE_MISSES")
+        cancelYouTubeTreeRecovery()
+        val attempt = youtubeTreeMissRetries
+        pendingYouTubeRecoveryRunnable = Runnable {
+            pendingYouTubeRecoveryRunnable = null
+            if (youtubeShortsSessionActive) {
+                if (checkNodeTreeStrictlyForReels(YOUTUBE_PACKAGE)) {
+                    confirmYouTubeShortsSession("tree re-check #$attempt")
+                } else {
+                    recoverYouTubeTreeMiss(YOUTUBE_PACKAGE, appName, fromWindowChange = true)
+                }
+            }
+        }
+        handler.postDelayed(pendingYouTubeRecoveryRunnable!!, YOUTUBE_TREE_RETRY_DELAY_MS)
+        return true
+    }
+
+    /**
      * Instagram can temporarily omit its Reels viewer nodes during UI updates. Once a
      * Reels tab/click has confirmed the context, an inconclusive tree check must not
      * dismiss the counter; explicit exit clicks and negative-screen checks still do.
+     * YouTube uses the same idea through [recoverYouTubeTreeMiss], with a retry budget that is
+     * only spent on window changes.
      */
-    private fun retainInstagramReelContext(packageName: String): Boolean {
-        if (!packageName.contains("instagram") || !isCurrentlyWatchingReels) return false
+    private fun retainReelContextOnTransientMiss(
+        packageName: String,
+        appName: String,
+        fromWindowChange: Boolean
+    ): Boolean {
+        if (!isCurrentlyWatchingReels) return false
 
-        cachedIsReelContext = true
-        Log.d(TAG, "[REEL] pkg=$packageName  retaining active state during transient tree miss")
-        return true
+        if (packageName.contains("instagram")) {
+            cachedIsReelContext = true
+            Log.d(TAG, "[REEL] pkg=$packageName  retaining active state during transient tree miss")
+            return true
+        }
+
+        if (packageName == YOUTUBE_PACKAGE) {
+            return recoverYouTubeTreeMiss(packageName, appName, fromWindowChange)
+        }
+
+        return false
     }
 
     private fun scheduleEvaluation(activePkg: String, appName: String) {
@@ -224,15 +343,19 @@ class ScrollDetectionEngine(
         pendingEvalRunnable = Runnable {
             // Re-evaluate reel context using the live node tree — no dummy AccessibilityEvent needed
             val isReel = checkNodeTreeStrictlyForReels(activePkg)
-            if (isReel != isCurrentlyWatchingReels) {
-                if (isReel) {
+            if (isReel) {
+                if (activePkg == YOUTUBE_PACKAGE) {
+                    confirmYouTubeShortsSession("scheduled tree check")
+                } else if (!isCurrentlyWatchingReels) {
                     isCurrentlyWatchingReels = true
                     cachedIsReelContext = true
                     onReelVisibilityChanged?.invoke(activePkg, appName, true)
                     Log.d(TAG, "[REEL] pkg=$activePkg  active=true  (via scheduled eval)")
-                } else if (!retainInstagramReelContext(activePkg)) {
-                    setReelInactive(activePkg, appName)
                 }
+            } else if (isCurrentlyWatchingReels &&
+                !retainReelContextOnTransientMiss(activePkg, appName, fromWindowChange = false)
+            ) {
+                setReelInactive(activePkg, appName)
             }
         }
         handler.postDelayed(pendingEvalRunnable!!, 300L)
@@ -270,7 +393,9 @@ class ScrollDetectionEngine(
         if (isReelClick) {
             Log.d(TAG, "[CLICK] Reel/Shorts tap detected in $packageName")
             cachedIsReelContext = true
-            if (!isCurrentlyWatchingReels) {
+            if (packageName == YOUTUBE_PACKAGE) {
+                confirmYouTubeShortsSession("Shorts tab tap")
+            } else if (!isCurrentlyWatchingReels) {
                 isCurrentlyWatchingReels = true
                 onReelVisibilityChanged?.invoke(packageName, appName, true)
                 Log.d(TAG, "[REEL] pkg=$packageName  active=true  (via click)")
@@ -299,10 +424,7 @@ class ScrollDetectionEngine(
 
         if (isExitClick) {
             Log.d(TAG, "[CLICK] Exit-reel tap detected in $packageName  resId=$resId")
-            cachedIsReelContext = false
-            if (isCurrentlyWatchingReels) {
-                setReelInactive(packageName, appName)
-            }
+            endReelSession(packageName, appName, "exit tap (resId=$resId)")
         }
     }
 
@@ -310,7 +432,7 @@ class ScrollDetectionEngine(
         val now = System.currentTimeMillis()
 
         if (packageName == YOUTUBE_PACKAGE) {
-            if (handleYouTubeShortsPagerScroll(appName, event, now)) return
+            if (handleYouTubeShortsScroll(appName, event, now)) return
             // Sibling scroll event emitted during the same Shorts swipe: never count it twice.
             if (now - lastYouTubePagerEventTimestamp < YOUTUBE_SWIPE_BURST_GAP_MS) return
         }
@@ -355,21 +477,28 @@ class ScrollDetectionEngine(
         // Quick negative check
         val className = event.className?.toString() ?: ""
         if (isUnambiguousNegativeScreen(packageName, className, event)) {
-            cachedIsReelContext = false
-            if (isCurrentlyWatchingReels) {
-                setReelInactive(packageName, appName)
-            }
+            endReelSession(packageName, appName, "negative screen on swipe")
             return
         }
 
         // Confirm reel context
-        val isReel = if (isTikTok(packageName)) {
-            !isUnambiguousNegativeScreen(packageName, className, event)
+        val treeSaysReel = if (isTikTok(packageName)) {
+            true
         } else {
             cachedIsReelContext || isPositiveReelScreen(packageName, className, event)
         }
 
-        if (!isReel) return
+        if (!treeSaysReel) {
+            if (packageName == YOUTUBE_PACKAGE) {
+                Log.d(TAG, "[SCROLL] YouTube swipe not counted — no Shorts evidence yet " +
+                        "(session=$youtubeShortsSessionActive, cached=$cachedIsReelContext)")
+            }
+            return
+        }
+
+        if (packageName == YOUTUBE_PACKAGE && !youtubeShortsSessionActive) {
+            confirmYouTubeShortsSession("generic swipe + tree check")
+        }
 
         lastScrollTimestamp = now
         if (!isCurrentlyWatchingReels) {
@@ -383,40 +512,178 @@ class ScrollDetectionEngine(
     }
 
     /**
-     * YouTube Shorts swipe detection. The event's own source identifies the Shorts pager
-     * (`reel_recycler`), so the decision no longer depends on a window-wide tree scan that can
-     * miss while the pager is mid-transition and clear the reel context. Events from one swipe
-     * arrive as a burst; only the first event of each burst is counted.
+     * YouTube Shorts swipe detection.
      *
-     * @return true if the event came from the Shorts pager and was fully handled here
-     *         (counted or recognised as part of an already-counted swipe); false to let the
-     *         existing path decide.
+     * Three independent evidence sources are combined (see [YouTubeShortsRules]): the view id of
+     * the scroll source, the source's geometry, and the sticky Shorts session. Any one of them is
+     * enough once it is corroborated by vertical movement, so counting keeps working when YouTube
+     * renames a view, ships views without ids, or returns no source node at all — the three ways
+     * this detector has failed on real devices.
+     *
+     * Events for a single swipe arrive as a burst and are collapsed by the burst gap plus a
+     * per-swipe cooldown.
+     *
+     * @return true when the event was decided here (counted, or swallowed as a duplicate, a
+     *         jitter, a sideways move, or a comment-sheet scroll); false to let the generic path
+     *         run the window tree check.
      */
-    private fun handleYouTubeShortsPagerScroll(appName: String, event: AccessibilityEvent, now: Long): Boolean {
-        val source = event.source ?: return false
-        val sourceId = try { source.viewIdResourceName?.lowercase() ?: "" } catch (_: Exception) { "" }
-        try { source.recycle() } catch (_: Exception) {}
+    private fun handleYouTubeShortsScroll(appName: String, event: AccessibilityEvent, now: Long): Boolean {
+        val (screenWidth, screenHeight) = screenMetrics()
+        val source = try { event.source } catch (_: Exception) { null }
 
-        if (!sourceId.endsWith(YOUTUBE_PAGER_ID_SUFFIX)) {
-            val dy = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) event.scrollDeltaY else Int.MIN_VALUE
-            Log.d(TAG, "[YT-SCROLL] not the Shorts pager: src=$sourceId class=${event.className} dy=$dy")
-            return false
+        var viewId = ""
+        var className = event.className?.toString()?.lowercase() ?: ""
+        var sourceScrollable = false
+        var widthFraction = YouTubeScrollSignals.UNKNOWN_GEOMETRY
+        var heightFraction = YouTubeScrollSignals.UNKNOWN_GEOMETRY
+        var fullScreenVideoSurface = false
+
+        if (source != null) {
+            try {
+                viewId = try { source.viewIdResourceName?.lowercase() ?: "" } catch (_: Exception) { "" }
+                val sourceClass = try { source.className?.toString()?.lowercase() ?: "" } catch (_: Exception) { "" }
+                if (sourceClass.isNotEmpty()) className = sourceClass
+                sourceScrollable = try { source.isScrollable } catch (_: Exception) { false }
+
+                if (screenWidth > 0 && screenHeight > 0) {
+                    val rect = Rect()
+                    try { source.getBoundsInScreen(rect) } catch (_: Exception) {}
+                    if (rect.width() > 0 && rect.height() > 0) {
+                        widthFraction = rect.width().toFloat() / screenWidth.toFloat()
+                        heightFraction = rect.height().toFloat() / screenHeight.toFloat()
+                    }
+                }
+
+                // The surface scan walks the subtree, so it only runs when it can actually be the
+                // tie-breaker: no decisive id and no session open yet.
+                if (!YouTubeShortsRules.isShortsPagerMarker(viewId) && !youtubeShortsSessionActive) {
+                    fullScreenVideoSurface = containsFullScreenVideoSurface(source, screenHeight)
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "[YT] Could not read the scroll source node", e)
+            } finally {
+                try { source.recycle() } catch (_: Exception) {}
+            }
         }
 
-        val isNewSwipe = now - lastYouTubePagerEventTimestamp >= YOUTUBE_SWIPE_BURST_GAP_MS
-        lastYouTubePagerEventTimestamp = now
-        if (!isNewSwipe) return true
-
-        cachedIsReelContext = true
-        if (!isCurrentlyWatchingReels) {
-            isCurrentlyWatchingReels = true
-            onReelVisibilityChanged?.invoke(YOUTUBE_PACKAGE, appName, true)
-            Log.d(TAG, "[REEL] pkg=$YOUTUBE_PACKAGE  active=true  (via Shorts pager scroll)")
+        // A scroll owned by a comment sheet, chip bar, or panel is never a Shorts swipe, and the
+        // pager is still alive in the tree behind it — so the generic path must not reconsider it.
+        if (YouTubeShortsRules.isNonPagerViewId(viewId)) {
+            Log.d(TAG, "[YT-SCROLL] Swallowed — scroll owned by a YouTube panel/sheet: src=$viewId")
+            return true
         }
-        lastScrollTimestamp = now
-        Log.d(TAG, "[SCROLL] YouTube Shorts swipe counted")
-        onScrollDetected(YOUTUBE_PACKAGE, appName)
-        return true
+
+        val hasDeltas = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+        val deltaX = if (hasDeltas) event.scrollDeltaX else YouTubeScrollSignals.NO_DELTA
+        val deltaY = if (hasDeltas) event.scrollDeltaY else YouTubeScrollSignals.NO_DELTA
+
+        val signals = YouTubeScrollSignals(
+            sourceViewId = viewId,
+            sourceClassName = className,
+            sourceIsScrollable = sourceScrollable,
+            sourceWidthFraction = widthFraction,
+            sourceHeightFraction = heightFraction,
+            deltaX = deltaX,
+            deltaY = deltaY,
+            hasDirectionalDeltas = hasDeltas &&
+                    !(deltaX == YouTubeScrollSignals.NO_DELTA && deltaY == YouTubeScrollSignals.NO_DELTA),
+            fullScreenVideoSurface = fullScreenVideoSurface,
+            shortsSessionConfirmed = youtubeShortsSessionActive,
+            msSinceLastCountedSwipe = if (lastScrollTimestamp == 0L) Long.MAX_VALUE else now - lastScrollTimestamp,
+            msSinceLastPagerEvent = if (lastYouTubePagerEventTimestamp == 0L) Long.MAX_VALUE else now - lastYouTubePagerEventTimestamp
+        )
+
+        val verdict = YouTubeShortsRules.classify(signals, screenHeight)
+
+        return when (verdict) {
+            YouTubeSwipeVerdict.COUNT -> {
+                lastYouTubePagerEventTimestamp = now
+                lastScrollTimestamp = now
+                confirmYouTubeShortsSession("Shorts swipe")
+                Log.d(TAG, "[SCROLL] YouTube Shorts swipe counted")
+                onScrollDetected(YOUTUBE_PACKAGE, appName)
+                true
+            }
+
+            YouTubeSwipeVerdict.DUPLICATE_BURST_EVENT,
+            YouTubeSwipeVerdict.COOLDOWN -> {
+                // Keep extending the burst window so a long settle cannot leak a second count.
+                lastYouTubePagerEventTimestamp = now
+                true
+            }
+
+            YouTubeSwipeVerdict.HORIZONTAL,
+            YouTubeSwipeVerdict.MOVEMENT_TOO_SMALL -> {
+                Log.d(TAG, "[YT-SCROLL] Swallowed — $verdict dx=$deltaX dy=$deltaY")
+                true
+            }
+
+            YouTubeSwipeVerdict.NOT_SHORTS_PAGER,
+            YouTubeSwipeVerdict.NEEDS_SHORTS_CONFIRMATION -> {
+                val heightLog = if (heightFraction < 0f) "unknown" else "${(heightFraction * 100).toInt()}%"
+                Log.d(TAG, "[YT-SCROLL] Inconclusive — $verdict src=${viewId.ifEmpty { "none" }} " +
+                        "class=$className scrollable=$sourceScrollable height=$heightLog dy=$deltaY " +
+                        "surface=$fullScreenVideoSurface session=$youtubeShortsSessionActive")
+                if (!youtubeShortsSessionActive) {
+                    // Let the async re-check open the session so the next swipe counts even if
+                    // this window scan is empty right now.
+                    scheduleEvaluation(YOUTUBE_PACKAGE, appName)
+                }
+                false
+            }
+        }
+    }
+
+    /**
+     * Bounded scan of the scroll source's subtree for a video surface that fills the screen.
+     * That is what separates the Shorts pager from YouTube's portrait watch page, where the
+     * player occupies only the top part of the screen.
+     */
+    private fun containsFullScreenVideoSurface(node: AccessibilityNodeInfo, screenHeightPx: Int): Boolean {
+        if (screenHeightPx <= 0) return false
+
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(node)
+        var visited = 0
+
+        while (queue.isNotEmpty() && visited < MAX_YOUTUBE_SURFACE_SCAN_NODES) {
+            val current = queue.removeFirst()
+            visited++
+
+            val className = try { current.className?.toString()?.lowercase() ?: "" } catch (_: Exception) { "" }
+            val viewId = try { current.viewIdResourceName?.lowercase() ?: "" } catch (_: Exception) { "" }
+            val looksLikeVideoSurface =
+                YouTubeShortsRules.VIDEO_SURFACE_MARKERS.any { className.contains(it) } ||
+                        YouTubeShortsRules.VIDEO_SURFACE_MARKERS.any { viewId.contains(it) }
+
+            if (looksLikeVideoSurface) {
+                val rect = Rect()
+                try { current.getBoundsInScreen(rect) } catch (_: Exception) {}
+                if (rect.height() >= screenHeightPx * YouTubeShortsRules.MIN_SURFACE_HEIGHT_FRACTION &&
+                    rect.width() > 0
+                ) {
+                    return true
+                }
+            }
+
+            val childCount = try { current.childCount } catch (_: Exception) { 0 }
+            for (i in 0 until childCount) {
+                try { current.getChild(i)?.let { queue.add(it) } } catch (_: Exception) {}
+            }
+        }
+        return false
+    }
+
+    /** Screen size in px, used to turn node bounds into fractions. `0` when unknown. */
+    private fun screenMetrics(): Pair<Int, Int> {
+        return try {
+            val metrics = service?.resources?.displayMetrics
+                ?: android.content.res.Resources.getSystem().displayMetrics
+            (metrics?.widthPixels ?: 0) to (metrics?.heightPixels ?: 0)
+        } catch (e: Exception) {
+            Log.w(TAG, "[SCREEN] Could not read display metrics", e)
+            0 to 0
+        }
     }
 
     /**
@@ -547,10 +814,14 @@ class ScrollDetectionEngine(
 
         // 1. Strict Negative Check
         if (isUnambiguousNegativeScreen(packageName, className, event)) {
-            cachedIsReelContext = false
-            if (isCurrentlyWatchingReels) {
-                setReelInactive(packageName, appName)
+            if (packageName == YOUTUBE_PACKAGE && youtubeShortsSessionActive && !force) {
+                // Content updates fire constantly inside Shorts and can carry the bottom-tab
+                // labels; only a real window change may end the session from here.
+                Log.d(TAG, "[YT] Negative keywords during a content update — session kept")
+                return
             }
+            Log.d(TAG, "[EVAL] Negative screen for $packageName  class=$className")
+            endReelSession(packageName, appName, "negative screen")
             return
         }
 
@@ -558,13 +829,17 @@ class ScrollDetectionEngine(
         val isReel = isPositiveReelScreen(packageName, className, event)
 
         if (isReel) {
-            cachedIsReelContext = true
-            if (!isCurrentlyWatchingReels) {
-                isCurrentlyWatchingReels = true
-                onReelVisibilityChanged?.invoke(packageName, appName, true)
-                Log.d(TAG, "[REEL] pkg=$packageName  active=true  (via evaluation)")
+            if (packageName == YOUTUBE_PACKAGE) {
+                confirmYouTubeShortsSession(if (force) "window scan" else "content scan")
+            } else {
+                cachedIsReelContext = true
+                if (!isCurrentlyWatchingReels) {
+                    isCurrentlyWatchingReels = true
+                    onReelVisibilityChanged?.invoke(packageName, appName, true)
+                    Log.d(TAG, "[REEL] pkg=$packageName  active=true  (via evaluation)")
+                }
             }
-        } else if (!retainInstagramReelContext(packageName)) {
+        } else if (!retainReelContextOnTransientMiss(packageName, appName, fromWindowChange = force)) {
             cachedIsReelContext = false
             if (isCurrentlyWatchingReels) {
                 setReelInactive(packageName, appName)
@@ -619,6 +894,7 @@ class ScrollDetectionEngine(
 
             packageName.contains("youtube") -> {
                 if ((allText.contains("home") && allText.contains("subscriptions") && !allText.contains("shorts")) ||
+                    allText.contains("add a comment") ||
                     lowerClass.contains("homefragment") ||
                     lowerClass.contains("browsefragment") ||
                     lowerClass.contains("settingsactivity") ||
@@ -993,23 +1269,119 @@ class ScrollDetectionEngine(
     }
 
     /**
-     * YouTube Shorts detection:
-     * 1. View ID reel_player_page_container.
-     * 2. Selected Shorts tab.
+     * Like [hasVisibleViewId], but tolerant of nodes Android reports as not visible to the user:
+     * a SurfaceView behind a transparent overlay is regularly flagged that way, which is enough on
+     * its own to lose the whole Shorts session. To keep this from matching a YouTube fragment that
+     * is attached but off screen, such a node only counts when it is laid out over at least half
+     * the screen.
+     */
+    private fun hasViewIdInTree(root: AccessibilityNodeInfo, fullyQualifiedId: String): Boolean {
+        return try {
+            val nodes = root.findAccessibilityNodeInfosByViewId(fullyQualifiedId)
+            if (nodes.isEmpty()) return false
+            if (nodes.any(::isNodeVisibleToTheUser)) return true
+
+            val screenHeight = screenMetrics().second
+            nodes.any { node ->
+                val rect = Rect()
+                try { node.getBoundsInScreen(rect) } catch (_: Exception) {}
+                rect.width() > 0 &&
+                        (screenHeight <= 0 || rect.height() * 2 >= screenHeight)
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * YouTube Shorts detection, ordered from the most decisive evidence to the structural
+     * fallback, because YouTube renames views between versions and often reports no id at all:
+     *  1. Any known Shorts pager/container view id (`reel_recycler`, `reel_player_page_container`,
+     *     `reel_watch_fragment_root`, …).
+     *  2. A node labelled "Shorts" that is selected — the bottom tab while Shorts is open.
+     *  3. Structural: a full-screen scrollable container that holds a full-screen video surface.
+     *     That is the shape of the Shorts pager; the home feed, the watch page, and search never
+     *     combine both halves of it.
      */
     private fun isYouTubeShortsActive(root: AccessibilityNodeInfo, packageName: String): Boolean {
-        if (hasVisibleViewId(root, "$packageName:id/reel_player_page_container")) return true
-        // Full-screen Shorts pager; absent from the home Shorts shelf, search and watch page.
-        if (hasVisibleViewId(root, "$packageName:id/reel_recycler")) return true
-
-        try {
-            val tabNodes = root.findAccessibilityNodeInfosByText("Shorts")
-            if (tabNodes.isNotEmpty() && tabNodes.any { it.isSelected && isNodeVisibleToTheUser(it) }) {
+        for (idName in YouTubeShortsRules.SHORTS_CONTAINER_VIEW_IDS) {
+            if (hasViewIdInTree(root, "$packageName:id/$idName")) {
+                Log.d(TAG, "[YT] Shorts confirmed by view id: $idName")
                 return true
             }
-        } catch (_: Exception) {}
+        }
 
-        return false
+        val (screenWidth, screenHeight) = screenMetrics()
+        var isSelectedShortsTab = false
+        var hasFullScreenPager = false
+        var hasFullScreenSurface = false
+
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        var visited = 0
+
+        while (queue.isNotEmpty() && visited < MAX_YOUTUBE_TREE_SCAN_NODES) {
+            val node = queue.removeFirst()
+            visited++
+
+            val viewId = try { node.viewIdResourceName?.lowercase() ?: "" } catch (_: Exception) { "" }
+            val className = try { node.className?.toString()?.lowercase() ?: "" } catch (_: Exception) { "" }
+
+            if (viewId.isNotEmpty() && YouTubeShortsRules.isShortsPagerMarker(viewId)) {
+                Log.d(TAG, "[YT] Shorts confirmed by pager marker: $viewId")
+                return true
+            }
+
+            val label = try {
+                "${node.text ?: ""} ${node.contentDescription ?: ""}".lowercase()
+            } catch (_: Exception) {
+                ""
+            }
+            if (!isSelectedShortsTab && label.contains("shorts")) {
+                val selected = try { node.isSelected || node.isFocused } catch (_: Exception) { false }
+                if (selected && isNodeVisibleToTheUser(node)) isSelectedShortsTab = true
+            }
+
+            if (screenWidth > 0 && screenHeight > 0 && (!hasFullScreenPager || !hasFullScreenSurface)) {
+                val rect = Rect()
+                try { node.getBoundsInScreen(rect) } catch (_: Exception) {}
+                if (rect.width() > 0 && rect.height() > 0) {
+                    val widthFraction = rect.width().toFloat() / screenWidth.toFloat()
+                    val heightFraction = rect.height().toFloat() / screenHeight.toFloat()
+                    if (!hasFullScreenPager &&
+                        isNodeVisibleToTheUser(node) &&
+                        YouTubeShortsRules.isFullScreenPager(
+                            sourceWidthFraction = widthFraction,
+                            sourceHeightFraction = heightFraction,
+                            isScrollable = try { node.isScrollable } catch (_: Exception) { false },
+                            classNameLowercase = className
+                        )
+                    ) {
+                        hasFullScreenPager = true
+                    }
+                    if (!hasFullScreenSurface &&
+                        heightFraction >= YouTubeShortsRules.MIN_SURFACE_HEIGHT_FRACTION &&
+                        (YouTubeShortsRules.VIDEO_SURFACE_MARKERS.any { className.contains(it) } ||
+                                YouTubeShortsRules.VIDEO_SURFACE_MARKERS.any { viewId.contains(it) })
+                    ) {
+                        hasFullScreenSurface = true
+                    }
+                }
+            }
+
+            val childCount = try { node.childCount } catch (_: Exception) { 0 }
+            for (i in 0 until childCount) {
+                try { node.getChild(i)?.let { queue.add(it) } } catch (_: Exception) {}
+            }
+        }
+
+        if (isSelectedShortsTab) {
+            Log.d(TAG, "[YT] Shorts confirmed by the selected Shorts tab")
+            return true
+        }
+        val structural = hasFullScreenPager && hasFullScreenSurface
+        if (structural) Log.d(TAG, "[YT] Shorts confirmed structurally (full-screen pager + video)")
+        return structural
     }
 
     /**

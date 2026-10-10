@@ -94,25 +94,53 @@ class ScrollyAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         Log.i(TAG, "[SERVICE] onServiceConnected — configuring event types")
+        applyServiceInfo()
+        _isServiceActive.value = true
+    }
+
+    /**
+     * (Re)applies the event types, flags, and timeout the detector needs.
+     *
+     * The service's existing [android.accessibilityservice.AccessibilityServiceInfo] is mutated
+     * instead of being replaced by a fresh object: a brand-new info drops whatever the system had
+     * already configured, and some OEM builds ignore it. `FLAG_REPORT_VIEW_IDS` matters most — with
+     * it off, `viewIdResourceName` is always null and every id-based rule falls back to heuristics.
+     */
+    private fun applyServiceInfo() {
         try {
-            val info = AccessibilityServiceInfo().apply {
-                eventTypes =
-                    AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED   or
-                    AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED or
-                    AccessibilityEvent.TYPE_WINDOWS_CHANGED        or
-                    AccessibilityEvent.TYPE_VIEW_SCROLLED          or
-                    AccessibilityEvent.TYPE_VIEW_CLICKED
-                feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
-                flags =
-                    AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
-                    AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
-                notificationTimeout = 100
-            }
+            val info = serviceInfo ?: AccessibilityServiceInfo()
+            info.eventTypes =
+                AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED   or
+                AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED or
+                AccessibilityEvent.TYPE_WINDOWS_CHANGED        or
+                AccessibilityEvent.TYPE_VIEW_SCROLLED          or
+                AccessibilityEvent.TYPE_VIEW_CLICKED
+            info.feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
+            info.flags = info.flags or
+                AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
+                AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
+            info.notificationTimeout = 100
             this.serviceInfo = info
+
+            val effective = this.serviceInfo
+            val viewIdsOn = effective != null &&
+                    effective.flags and AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS != 0
+            Log.i(
+                TAG,
+                "[SERVICE] config applied — viewIds=$viewIdsOn  " +
+                "flags=${effective?.flags}  timeout=${effective?.notificationTimeout}  " +
+                "packageFilter=${effective?.packageNames?.joinToString() ?: "unset"}"
+            )
+            if (!viewIdsOn) {
+                Log.w(
+                    TAG,
+                    "[SERVICE] FLAG_REPORT_VIEW_IDS did not stick — Shorts counting relies on the " +
+                    "Shorts session, node geometry, and the full-screen video surface instead"
+                )
+            }
         } catch (e: Exception) {
             Log.w(TAG, "[SERVICE] Could not configure serviceInfo", e)
         }
-        _isServiceActive.value = true
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -173,6 +201,7 @@ class ScrollyAccessibilityService : AccessibilityService() {
 
     private fun incrementCount(pkg: String, appName: String) {
         val optimisticCount = ScrollyApp.instance.trackingRepository.todayTotalScrolls.value + 1
+        Log.d(TAG, "[COUNT] +1 $appName ($pkg) → today=$optimisticCount")
         mainHandler.post {
             notchFloatingBarManager?.updateCount(
                 optimisticCount,
